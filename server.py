@@ -37,6 +37,11 @@ MEDIA_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov",
     ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".wma",
 }
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov"}
+SCREENSHOT_SAMPLE_STEP = 0.5
+SCREENSHOT_STABLE_DIFF = 0.002
+SCREENSHOT_PIXEL_DELTA = 0.08
+SCREENSHOT_SETTLE_LIMIT = 3.0
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(APP_NAME)
@@ -98,6 +103,63 @@ def _fmt(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
+def _extract_screenshots(path: Path, target_dir: Path, threshold: float, min_interval: float,
+                         max_count: int, on_progress) -> list[tuple[float, str]]:
+    """Сохраняет кадры при смене картинки; возвращает список (время начала смены, имя файла).
+
+    Кадр-кандидат сохраняется, только когда картинка перестала меняться (или через
+    SCREENSHOT_SETTLE_LIMIT секунд), чтобы не ловить середину перехода.
+    """
+    import av
+    import numpy as np
+
+    def thumb(frame):
+        return frame.reformat(width=320, height=180, format="gray").to_ndarray().astype(np.float32) / 255.0
+
+    def diff(a, b):
+        return float(np.mean(np.abs(a - b) > SCREENSHOT_PIXEL_DELTA))
+
+    shots: list[tuple[float, str]] = []
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(frame, at: float):
+        name = "{:02d}-{:02d}-{:02d}.jpg".format(int(at) // 3600, int(at) % 3600 // 60, int(at) % 60)
+        frame.to_image().save(target_dir / name, quality=90)
+        shots.append((at, name))
+        on_progress(len(shots))
+
+    with av.open(str(path), mode="r") as container:
+        if not container.streams.video:
+            return shots
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        next_sample = 0.0
+        saved_thumb = prev_thumb = None
+        saved_at = -min_interval
+        pending_at: float | None = None
+        for frame in container.decode(stream):
+            if frame.time is None or frame.time < next_sample:
+                continue
+            next_sample = frame.time + SCREENSHOT_SAMPLE_STEP
+            current = thumb(frame)
+            if saved_thumb is None:
+                save(frame, frame.time)
+                saved_thumb, saved_at = current, frame.time
+            elif pending_at is None:
+                if frame.time - saved_at >= min_interval and diff(current, saved_thumb) > threshold:
+                    pending_at = frame.time
+            elif (diff(current, prev_thumb) < SCREENSHOT_STABLE_DIFF
+                  or frame.time - pending_at >= SCREENSHOT_SETTLE_LIMIT):
+                if diff(current, saved_thumb) > threshold:
+                    save(frame, pending_at)
+                    saved_thumb, saved_at = current, frame.time
+                pending_at = None
+            prev_thumb = current
+            if len(shots) >= max_count:
+                break
+    return shots
+
+
 def _update(job_id: str, **fields: Any) -> None:
     with _jobs_lock:
         _jobs[job_id].update(fields)
@@ -107,6 +169,23 @@ def _run_job(job_id: str) -> None:
     job = _jobs[job_id]
     source = Path(job["file_path"])
     out_file = Path(job["output_file"])
+    shots: list[tuple[float, str]] = []
+    shots_error: list[str] = []
+    shots_thread = None
+    if job["screenshots"]:
+        def collect():
+            try:
+                shots.extend(_extract_screenshots(
+                    source, out_file.parent / "screenshots", job["scene_threshold"],
+                    job["min_interval"], job["max_screenshots"],
+                    lambda n: _update(job_id, screenshots=n)))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("screenshots failed: %s", traceback.format_exc())
+                shots_error.append(f"{type(exc).__name__}: {exc}")
+
+        shots_thread = threading.Thread(target=collect, name=f"screenshots-{job_id}", daemon=True)
+        shots_thread.start()
+
     _update(job_id, status="decoding_audio", started_at=time.time())
     audio = _decode_audio(source)
     _update(job_id, status="loading_model")
@@ -123,23 +202,33 @@ def _run_job(job_id: str) -> None:
     )
     _update(job_id, duration=info.duration, language=info.language)
 
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[tuple[float, str]] = []
+    for segment in segments:
+        lines.append((segment.start, f"[{_fmt(segment.start)}] {segment.text.strip()}"))
+        _update(job_id, segments=len(lines), position=segment.end)
+
+    if shots_thread is not None:
+        _update(job_id, status="extracting_screenshots")
+        shots_thread.join()
+
     header = (
         "# Транскрипт\n\n"
         f"Запись: {source.name}, длительность {_fmt(info.duration)}.\n"
         f"Распознавание: faster-whisper {job['model']} ({device}), язык {info.language} "
         f"({info.language_probability:.0%}).\n"
-        "Спикеры не разделены: диаризация недоступна.\n\n"
+        "Спикеры не разделены: диаризация недоступна.\n"
     )
-    count = 0
-    with out_file.open("w", encoding="utf-8") as handle:
-        handle.write(header)
-        for segment in segments:
-            handle.write(f"[{_fmt(segment.start)}] {segment.text.strip()}\n")
-            handle.flush()
-            count += 1
-            _update(job_id, segments=count, position=segment.end)
-    _update(job_id, status="done", finished_at=time.time())
+    if job["screenshots"]:
+        header += (f"Скриншоты: {len(shots)} при смене картинки, каталог screenshots/.\n"
+                   if not shots_error else f"Скриншоты не извлечены: {shots_error[0]}\n")
+    body: list[tuple[float, int, str]] = [(at, 0, line) for at, line in lines]
+    body += [(at, -1, f"\n![{_fmt(at)}](screenshots/{name})\n") for at, name in shots]
+    body.sort(key=lambda item: (item[0], item[1]))
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(header + "\n" + "\n".join(item[2] for item in body) + "\n", encoding="utf-8")
+    _update(job_id, status="done", finished_at=time.time(), screenshots=len(shots),
+            screenshots_error=shots_error[0] if shots_error else None)
 
 
 def _worker() -> None:
@@ -177,10 +266,15 @@ def start_transcription(
     model: Annotated[str | None, Field(description="Модель faster-whisper; по умолчанию large-v3-turbo")] = None,
     initial_prompt: Annotated[str | None, Field(description="Подсказка с терминами и именами для лучшего распознавания")] = None,
     beam_size: Annotated[int, Field(description="Ширина луча декодирования", ge=1, le=10)] = 5,
+    screenshots: Annotated[bool, Field(description="Сохранять скриншоты при смене картинки (только для видео)")] = True,
+    scene_threshold: Annotated[float, Field(description="Порог смены картинки: доля изменившихся пикселей экрана 0–1; меньше — больше скриншотов", gt=0, le=1)] = 0.02,
+    min_interval: Annotated[float, Field(description="Минимум секунд между скриншотами", ge=1)] = 5.0,
+    max_screenshots: Annotated[int, Field(description="Максимум скриншотов на файл", ge=1, le=2000)] = 300,
 ) -> str:
     """Ставит файл в очередь локальной расшифровки и возвращает job_id.
 
-    Результат — transcript.md с метками времени. Задачи выполняются по одной.
+    Результат — transcript.md с метками времени; для видео — скриншоты при смене картинки
+    в каталоге screenshots/ со ссылками в тексте. Задачи выполняются по одной.
     Статус и текст — через get_transcription_status.
     """
     source = Path(file_path)
@@ -201,6 +295,10 @@ def start_transcription(
             "language": language or None,
             "initial_prompt": initial_prompt,
             "beam_size": beam_size,
+            "screenshots": screenshots and source.suffix.lower() in VIDEO_EXTENSIONS,
+            "scene_threshold": scene_threshold,
+            "min_interval": min_interval,
+            "max_screenshots": max_screenshots,
             "segments": 0,
             "created_at": time.time(),
         }
@@ -216,7 +314,10 @@ def get_transcription_status(
     wait_seconds: Annotated[int, Field(description="Сколько секунд ждать завершения перед ответом", ge=0, le=600)] = 0,
     include_text: Annotated[bool, Field(description="Вернуть текст транскрипта, если задача завершена")] = False,
 ) -> str:
-    """Статус задачи: queued, decoding_audio, loading_model, transcribing, done, error; прогресс и путь к результату."""
+    """Статус задачи: queued, decoding_audio, loading_model, transcribing, extracting_screenshots, done, error.
+
+    Также прогресс, число скриншотов и путь к результату.
+    """
     if not job_id:
         with _jobs_lock:
             items = [_public(j, False) for j in _jobs.values()]
